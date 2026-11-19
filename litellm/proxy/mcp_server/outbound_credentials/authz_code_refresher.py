@@ -48,6 +48,7 @@ class CredentialPersist(Protocol):
         scopes: tuple[str, ...] | None,
         identity_binding_proof: str | None = None,
         cimd_client_id: str | None = None,
+        refreshed_from: str | None = None,
     ) -> None: ...
 
 
@@ -168,6 +169,7 @@ class AuthorizationCodeRefresher:
             scopes,
             **({"identity_binding_proof": binding_proof} if binding_proof is not None else {}),
             **({"cimd_client_id": cimd_client_id} if cimd_client_id is not None else {}),
+            refreshed_from=token.refresh_token,
         )
         return OAuthToken(
             access_token=access_token,

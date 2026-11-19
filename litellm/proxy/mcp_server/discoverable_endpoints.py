@@ -705,6 +705,7 @@ async def _store_per_user_token_server_side(
     identity_binding_proof: str | None = None,
     cimd_client_id: str | None = None,
     requested_scope: str | None = None,
+    refreshed_from: str | None = None,
 ) -> None:
     """Persist the OAuth token server-side and warm the Redis cache.
 
@@ -751,6 +752,7 @@ async def _store_per_user_token_server_side(
             expires_in=expires_in,
             scopes=scopes,
             identity_binding_proof=identity_binding_proof,
+            refreshed_from=refreshed_from,
             **({"cimd_client_id": cimd_client_id} if cimd_client_id is not None else {}),
         )
         verbose_logger.info(
@@ -1578,6 +1580,11 @@ async def exchange_token_with_server(
                         token_response=token_response,
                         identity_binding_proof=binding_proof,
                         requested_scope=requested_scope,
+                        refreshed_from=(
+                            refresh_ownership.refresh_token
+                            if isinstance(refresh_ownership, RefreshTokenPresented)
+                            else None
+                        ),
                         **({"cimd_client_id": cimd_client_id} if cimd_client_id is not None else {}),
                     )
                 else:

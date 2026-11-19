@@ -247,6 +247,7 @@ class OAuthCredentialPayload(_OAuthCredentialAccessToken, total=False):
     scopes: list[str]
     server_id: str
     needs_scopes: ReadOnly[Sequence[str]]
+    grant_id: ReadOnly[str]
 
 
 OAuthGrantState = Literal["valid", "refreshable", "absent"]
@@ -789,9 +790,11 @@ async def _db_update_mcp_server_row(
 
 def _user_credential_actions(
     prisma_client: PrismaClient,
+    *,
+    use_writer: bool = False,
 ) -> "TableActions[prisma_db_models.LiteLLM_MCPUserCredentials]":
     table: Final[TableActions[prisma_db_models.LiteLLM_MCPUserCredentials]] = MCPUserCredentialsRepository(
-        prisma_client
+        prisma_client, use_writer=use_writer
     ).table
     return table
 
@@ -807,9 +810,9 @@ def _user_env_var_actions(
 
 
 async def _db_find_user_credential_row(
-    prisma_client: PrismaClient, user_id: str, server_id: str
+    prisma_client: PrismaClient, user_id: str, server_id: str, *, use_writer: bool = False
 ) -> "prisma_db_models.LiteLLM_MCPUserCredentials | None":
-    return await _user_credential_actions(prisma_client).find_unique(
+    return await _user_credential_actions(prisma_client, use_writer=use_writer).find_unique(
         where={"user_id_server_id": {"user_id": user_id, "server_id": server_id}}
     )
 
@@ -1823,12 +1826,15 @@ async def store_user_oauth_credential(
     skip_byok_guard: bool = False,
     identity_binding_proof: str | None = None,
     cimd_client_id: str | None = None,
+    refreshed_from: str | None = None,
 ) -> None:
     """Persist an OAuth2 access token for a user+server pair.
 
     The payload is JSON-serialised and stored encrypted in the same
     ``credential_b64`` column used by BYOK.  A ``"type": "oauth2"`` key
     differentiates it from plain BYOK API keys.
+
+    A refresh keeps the grant's ``grant_id`` and scope refusals unless a newer sign-in replaced the grant.
     """
 
     expires_at: str | None = None
@@ -1848,6 +1854,10 @@ async def store_user_oauth_credential(
         payload["expires_at"] = expires_at
     if scopes is not None:
         payload["scopes"] = scopes
+    if refreshed_from is not None and await _save_refreshed_grant(
+        prisma_client, user_id, server_id, payload, refreshed_from
+    ):
+        return
 
     # Guard against silently overwriting a BYOK credential with an OAuth token.
     # Skip the guard when the caller knows the row is already an OAuth2 credential
@@ -1875,8 +1885,36 @@ async def store_user_oauth_credential(
                 server_id,
             )
 
-    encoded: Final = encrypt_value_helper(json.dumps(payload))
+    encoded: Final = encrypt_value_helper(json.dumps({**payload, "grant_id": uuid.uuid4().hex}))
     await _db_upsert_user_credential_row(prisma_client, user_id, server_id, encoded)
+
+
+async def _save_refreshed_grant(
+    prisma_client: PrismaClient,
+    user_id: str,
+    server_id: str,
+    payload: OAuthCredentialPayload,
+    refreshed_from: str,
+) -> bool:
+    row: Final = await _db_find_user_credential_row(prisma_client, user_id, server_id, use_writer=True)
+    saved: Final = None if row is None else decode_oauth_payload(row.credential_b64)
+    if row is None or saved is None:
+        return False
+    saved_refresh_token: Final = saved.get("refresh_token")
+    if saved_refresh_token and saved_refresh_token != refreshed_from:
+        return False
+    grant_id: Final = saved.get("grant_id")
+    refusals: Final = saved.get("needs_scopes")
+    refreshed: Final[Mapping[str, object]] = {
+        **payload,
+        **({"grant_id": grant_id} if grant_id else {}),
+        **({"needs_scopes": refusals} if refusals else {}),
+    }
+    written: Final = await _user_credential_actions(prisma_client).update_many(
+        where={"user_id": user_id, "server_id": server_id, "credential_b64": row.credential_b64},
+        data={"credential_b64": encrypt_value_helper(json.dumps(refreshed))},
+    )
+    return written > 0 or await _save_refreshed_grant(prisma_client, user_id, server_id, payload, refreshed_from)
 
 
 def is_oauth_credential_expired(cred: OAuthCredentialPayload, buffer_seconds: int = 0) -> bool:
@@ -1927,8 +1965,18 @@ async def get_user_oauth_credential(
 
 async def record_oauth_scope_refusal(prisma_client: PrismaClient, user_id: str, server_id: str, scope: str) -> None:
     """Note on the saved grant that the provider refused a call for ``scope``, so the connect page sends the user
-    back to the provider. The next save of the grant drops the note; a grant saved since the read is left alone."""
+    back to the provider. The next sign-in drops the note; a grant saved since the read is left alone."""
     row: Final = await _db_find_user_credential_row(prisma_client, user_id, server_id)
+    await _note_scope_refusal(prisma_client, user_id, server_id, row, scope)
+
+
+async def _note_scope_refusal(
+    prisma_client: PrismaClient,
+    user_id: str,
+    server_id: str,
+    row: "prisma_db_models.LiteLLM_MCPUserCredentials | None",
+    scope: str,
+) -> None:
     grant: Final = None if row is None else decode_oauth_payload(row.credential_b64)
     if row is None or grant is None:
         return
@@ -1936,13 +1984,25 @@ async def record_oauth_scope_refusal(prisma_client: PrismaClient, user_id: str, 
     refused: Final = tuple(name for name in dict.fromkeys(scope.split() or ("",)) if name not in waiting)
     if not refused:
         return
-    await _user_credential_actions(prisma_client).update_many(
+    written: Final = await _user_credential_actions(prisma_client).update_many(
         where={"user_id": user_id, "server_id": server_id, "credential_b64": row.credential_b64},
         data={
             "credential_b64": encrypt_value_helper(json.dumps({**grant, "needs_scopes": [*waiting, *refused]})),
             "updated_at": row.updated_at,
         },
     )
+    if written > 0:
+        return
+    latest: Final = await _db_find_user_credential_row(prisma_client, user_id, server_id, use_writer=True)
+    latest_grant: Final = None if latest is None else decode_oauth_payload(latest.credential_b64)
+    changed_by_this_grant: Final = (
+        latest is not None
+        and latest_grant is not None
+        and latest.credential_b64 != row.credential_b64
+        and latest_grant.get("grant_id") == grant.get("grant_id")
+    )
+    if changed_by_this_grant:
+        await _note_scope_refusal(prisma_client, user_id, server_id, latest, scope)
 
 
 def _server_user_credential_item(
@@ -2212,6 +2272,7 @@ async def refresh_user_oauth_token(
         identity_binding_proof=binding_proof,
         cimd_client_id=cred.get("cimd_client_id"),
         skip_byok_guard=True,  # Row is already OAuth2; skip the extra find_unique check
+        refreshed_from=refresh_token,
     )
 
     verbose_proxy_logger.info(
